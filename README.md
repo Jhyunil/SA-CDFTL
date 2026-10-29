@@ -1,770 +1,398 @@
-# FEMU - Fast, Accurate, and Extensible NVMe SSD Emulator
+# CDFTL on FEMU
 
-[![FEMU Version](https://img.shields.io/badge/FEMU-v10.1-brightgreen)](https://github.com/MoatLab/FEMU/releases)
-[![Build Status](https://github.com/MoatLab/FEMU/workflows/CI/badge.svg)](https://github.com/MoatLab/FEMU/actions)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 [![Platform](https://img.shields.io/badge/Platform-x86--64-brightgreen)](https://shields.io/)
 
-```
-  ______ ______ __  __ _    _
- |  ____|  ____|  \/  | |  | |
- | |__  | |__  | \  / | |  | |
- |  __| |  __| | |\/| | |  | |
- | |    | |____| |  | | |__| |
- |_|    |______|_|  |_|\____/  -- A fast, accurate, scalable, and extensible NVMe SSD Emulator
-```
+A demand-based, two-level cached flash translation layer (**CDFTL**) implemented
+inside the black-box SSD (`bbssd`) FTL of [FEMU](https://github.com/MoatLab/FEMU),
+the QEMU-based NVMe SSD emulator. On top of the CDFTL algorithms, this project adds
+a **batched translation-page update scheme for data garbage collection** that
+removes redundant read-modify-write cycles on the translation flash.
 
-**FEMU** is a fast, accurate, scalable, and extensible NVMe SSD emulator based on QEMU/KVM. It enables full-system evaluation of storage systems and supports multiple SSD architectures for systems research.
+The full design report with measurements and graphs is in
+[`docs/CDFTL-report.pdf`](docs/CDFTL-report.pdf).
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Features](#features)
+- [Background](#background)
+- [What Is Implemented](#what-is-implemented)
 - [Architecture](#architecture)
-- [System Requirements](#system-requirements)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-  - [BlackBox SSD Mode (BBSSD)](#blackbox-ssd-mode-bbssd)
-  - [WhiteBox SSD Mode (OCSSD)](#whitebox-ssd-mode-ocssd)
-  - [Zoned Namespace SSD Mode (ZNSSD)](#zoned-namespace-ssd-mode-znssd)
-  - [NoSSD Mode](#nossd-mode)
-- [Configuration](#configuration)
-- [Development](#development)
-- [Troubleshooting](#troubleshooting)
-- [Research & Citation](#research--citation)
-- [Contributing](#contributing)
-- [Support](#support)
+  - [Translation Flash](#translation-flash)
+  - [GTD, CMT and CTP](#gtd-cmt-and-ctp)
+  - [Translation Block Management](#translation-block-management)
+- [Algorithms](#algorithms)
+  - [Fetch-in](#fetch-in)
+  - [Replace](#replace)
+  - [Address Lookup and Update](#address-lookup-and-update)
+  - [Data GC](#data-gc)
+  - [Map GC](#map-gc)
+- [Batched Mapping Update in Data GC](#batched-mapping-update-in-data-gc)
+- [Evaluation](#evaluation)
+- [Statistics](#statistics)
+- [SSD Configuration](#ssd-configuration)
+- [Build and Run](#build-and-run)
+- [Repository Layout](#repository-layout)
+- [References](#references)
 - [License](#license)
-- [Acknowledgments](#acknowledgments)
 
 ---
 
-## Overview
+## Background
 
-FEMU bridges the gap between SSD hardware platforms and SSD simulators by providing:
+DFTL keeps the page-level mapping table on flash and caches individual mapping
+entries in RAM. It has two well-known weaknesses:
 
-- **Full system stack support** (Applications + OS + NVMe interface)
-- **Multiple SSD architectures** with configurable parameters
-- **High performance** suitable for systems research and development
-- **Extensible design** for exploring new SSD algorithms, architectures, interfaces, and software stacks.
+- **Eviction cost.** Evicting a single dirty mapping entry can consume a whole
+  translation page on flash, because the caching granularity is one entry.
+- **Locality.** Caching only individual entries exploits temporal locality but
+  ignores the spatial locality of sequential workloads.
 
-### Key Benefits
+**CDFTL** addresses both by caching at two granularities at once:
 
-- ✅ **Fast**: Sub-10μs latency emulation for performance-critical research
-- ✅ **Accurate**: Realistic SSD behavior modeling based on real hardware characteristics
-- ✅ **Scalable**: Support for large-capacity SSDs and multi-device configurations
-- ✅ **Extensible**: Modular architecture for easy customization and new feature development
+| Cache | Granularity | Locality exploited |
+|-------|-------------|--------------------|
+| Cached Mapping Table (**CMT**) | one mapping entry (`dlpn -> dppn`) | temporal |
+| Cached Translation Page (**CTP**) | one translation page (512 mappings) | spatial |
 
----
+The two caches share one RAM budget. A CMT entry costs one space unit and a CTP
+entry costs `N` units, so evicting `N` CMT entries makes room for one translation
+page in CTP. The split between the two caches therefore adapts to the workload.
 
-## Features
+## What Is Implemented
 
-| Feature | BlackBox | WhiteBox | ZNS | NoSSD |
-|---------|----------|----------|-----|--------|
-| **FTL Management** | Device-side | Host-side | Zone-based | None |
-| **Use Cases** | Commercial SSD simulation | OpenChannel SSD research | ZNS research | SCM emulation |
-| **Latency Model** | Realistic NAND | Realistic NAND | Zone-optimized | Ultra-low (sub-10μs) |
-| **Guest Support** | Full NVMe | OpenChannel 1.2/2.0 | NVMe ZNS | NVMe basic |
+- A dedicated **translation flash** emulated separately from the data flash.
+- **GTD**, **CMT** and **CTP** with hash-table lookup and LRU replacement.
+- CDFTL **Fetch-in**, **Replace** and **Garbage Collection** paths wired into the
+  FEMU `bbssd` mapping functions.
+- A separate **map GC** for translation blocks with a greedy victim policy.
+- A **bucket-based batched update** of translation pages during data GC.
+- **Statistics** (CMT/CTP hit ratio, cache miss ratio, translation-flash
+  read/write counts, WAF) exposed through an NVMe Get Log Page command.
 
----
+All FTL code lives in `hw/femu/bbssd/ftl.c` and `hw/femu/bbssd/ftl.h`. The
+statistics hook is in `hw/femu/bbssd/bb.c`.
 
 ## Architecture
 
 ```
-                        +--------------------+
-                        |    VM / Guest OS   |
-                        |                    |
-                        |                    |
-                        |  NVMe Block Device |
-                        +--------^^----------+
-                                 ||
-                              PCIe/NVMe
-                                 ||
-  +------------------------------vv----------------------------+
-  |  +---------+ +---------+ +---------+ +-----------+ +------+|
-  |  | BlackBox| | WhiteBox| | ZNS-SSD | |  NoSSD    | | ...  ||
-  |  |  (BBSSD)| | (OCSSD) | |(ZNSSD)  | |(Ultra-low)| |      ||
-  |  +---------+ +---------+ +---------+ +-----------+ +------+|
-  |                    FEMU NVMe SSD Controller                |
-  +------------------------------------------------------------+
-  |                          QEMU/KVM                          |
-  +------------------------------------------------------------+
-  |                        Host Linux                          |
-  +------------------------------------------------------------+
+          DRAM                                   Flash
+ +---------------------+          +----------------------------------+
+ |  GTD  (3072 x tppn) |          |  Translation flash (tnand)       |
+ |  CMT  (1024 x 8 B)  | <------> |  1 bank x 16 blk x 256 pg x 4 KB |
+ |  CTP  (  32 x 4 KB) |          +----------------------------------+
+ +---------------------+          |  Data flash (FEMU bbssd)         |
+                                  +----------------------------------+
 ```
 
-### Core Components
+### Translation Flash
 
-- **NVMe Controller**: Standards-compliant NVMe 1.3+ implementation
-- **SSD Modes**: Pluggable backends for different SSD architectures
-- **Timing Model**: Configurable latency simulation for realistic performance
-- **Memory Backend**: DRAM-based storage emulation
+Translation pages are stored in a small NAND emulator that is independent from
+the data flash. It uses the same page geometry as the data flash but does no
+striping, and it has its own garbage collector.
 
----
+| Parameter | Value |
+|-----------|-------|
+| Banks / planes | 1 / 1 |
+| Blocks | 16 |
+| Pages per block | 256 |
+| Page size | 4 KB |
+| Total size | 16 MB |
+| Mappings per translation page | 512 (`4096 / sizeof(struct ppa)`) |
 
-## System Requirements
+The whole space is managed through the `tnand` pointer and the following API.
+Every call returns `NAND_SUCCESS` (0) or a negative error code.
 
-### Minimum Requirements
+```c
+int tnand_init(int nbanks, int nblks, int npages);
+int tnand_read(int bank, int blk, int page, void *data);
+int tnand_write(int bank, int blk, int page, void *data);
+int tnand_erase(int bank, int blk);
 
-- **Physical Machine**: Run FEMU on a physical machine, not inside a VM (nested virtualization is not recommended due to performance impact)
-- **OS**: Linux (Ubuntu 18.04+, CentOS 7+, or equivalent)
-- **CPU**: x86_64 with hardware virtualization (Intel VT-x/AMD-V)
-- **Memory**: At least 12GB DRAM to enable seamless run of default FEMU scripts emulating a 4GB SSD
-- **CPU Cores**: At least 8 cores for 4 vCPUs and 4GB DRAM VM
-- **Storage**: 20GB free disk space
+#define NAND_SUCCESS         0
+#define NAND_ERR_INVALID    -1
+#define NAND_ERR_OVERWRITE  -2
+#define NAND_ERR_POSITION   -3
+#define NAND_ERR_EMPTY      -4
+```
 
-### Recommended Configuration
-- **CPU**: 16+ cores (Intel Xeon or AMD EPYC)
-- **Memory**: 32GB+ RAM
-- **Storage**: NVMe SSD with 100GB+ free space
-- **Network**: For distributed testing scenarios
+### GTD, CMT and CTP
 
-### Host Environment Compatibility
+| Structure | Implementation | Size |
+|-----------|----------------|------|
+| **GTD** (Global Translation Directory) | array indexed by `tvpn`; each entry holds `tppn`, a location bit (flash or CTP) and a dirty bit | `MAX_TVPN = 3072` entries |
+| **CMT** | hash table (`dlpn % 10` buckets) of singly-linked chains plus a doubly-linked LRU list | `MAX_CMTN = 1024` entries, 8 B each |
+| **CTP** | hash table (`tvpn % 5` buckets) plus an LRU list; each entry owns a 4 KB `map_page` | `MAX_CTPN = 32` pages, 4 KB each |
 
-| Linux Distribution | Kernel | GCC    | Ninja  | Python | Status |
-|:-------------------|:-------|:-------|:-------|:-------|:-------|
-| Ubuntu 24.04 LTS   | 6.8.0  | 13.2.0 | 1.12.1 | 3.12.3 | ✅ Tested |
-| Ubuntu 22.04 LTS   | 5.15.0 | 11.3.0 | 1.10.1 | 3.10.6 | ✅ Tested |
-| Ubuntu 20.04 LTS   | 5.4.0  | 9.3.0  | 1.10.0 | 3.8.2  | ✅ Tested |
-| Ubuntu 18.04 LTS   | 4.15.0 | 7.5.0  | 1.8.2  | 3.6.7  | ✅ Tested |
-| Ubuntu 16.04.5     | 4.15.0 | 5.4.0  | 1.8.2  | 3.6.0  | ⚠️ Legacy |
-| Gentoo             | 5.10   | 9.3.0  | 1.10.1 | 3.7.9  | ⚠️ Community |
+The cache budget is `1024 * 8 + 32 * 4096` bytes. The cache is considered full
+when the bytes currently occupied by CMT and CTP entries, plus one more CMT entry
+and one more CTP entry, would exceed that budget (`is_cache_full()`).
 
-### Guest Environment Compatibility
+### Translation Block Management
 
-| Mode \ Guest Kernel       | 4.16    | 4.20    | 5.4     | 5.10    | 6.1     | 6.9     |
-| :---                      | :---:   | :---:   | :---:   | :---:   | :---:   | :---:   |
-| NoSSD                     | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| BlackBox SSD              | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| OpenChannel-SSD v1.2      | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| OpenChannel-SSD v2.0      | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Zoned-Namespace (ZNS) SSD | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
+- **Free block list**: a FIFO queue (`Queuetype`) of erased translation blocks.
+- **Active block list**: a min-heap (`Heaptype`) of blocks that hold valid pages.
+- **Write cursor**: `tblk_curr` tracks the current block and next free page.
+- A reverse map `tp2l[tppn] -> tvpn` and a per-block invalid-page counter
+  (`blk_invalid[]`) support victim selection.
+- **GC threshold**: map GC runs as soon as the free list drops below one block.
 
-**Continuous Integration**: FEMU uses GitHub Actions for automated testing across multiple Ubuntu versions. The CI pipeline:
+## Algorithms
 
-- Tests compilation on Ubuntu 20.04, 22.04, and 24.04 LTS
-- Verifies FEMU device registration and all SSD modes (BlackBox, WhiteBox, ZNS, NoSSD)
-- Validates code quality and build system integration
-- Runs compatibility tests for configuration parameters and run scripts
-- Build status is shown in the badge at the top of this README
+### Fetch-in
 
----
+`fetch_in(dlpn)` is called on a cache miss in the read path.
 
-## Installation
+1. Check `is_cache_full()`.
+2. If the cache is full, make room for one CMT entry and one CTP entry:
+   - Evict one CMT entry by LRU.
+   - If enough CMT entries whose translation page is also resident in CTP exist
+     (at least one page's worth), flush those mappings into the cached page and
+     evict them from CMT. Otherwise evict one CTP entry by LRU, writing it back
+     to the translation flash if it is dirty.
+3. Read the translation page that contains `dlpn` with `tnand_read()`, insert
+   the requested mapping into CMT, and insert the whole page into CTP.
 
-### Build FEMU
+`ctp_fetch_in(dlpn)` is the same procedure without the CMT part. It is used by
+the write path when the target mapping is not cached anywhere.
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/MoatLab/FEMU.git
-   cd FEMU
-   ```
+### Replace
 
-2. **Create build directory:**
-   ```bash
-   mkdir build-femu
-   cd build-femu
-   ```
+`replace(dlpn, dppn)` updates a mapping after data is written to NAND. Four
+cases are handled:
 
-3. **Setup build environment and install dependencies:**
-   ```bash
-   # Copy FEMU helper scripts
-   cp ../femu-scripts/femu-copy-scripts.sh .
-   ./femu-copy-scripts.sh .
+| CMT | CTP | Action |
+|-----|-----|--------|
+| hit | hit | Update the page in CTP, remove every CMT entry that belongs to the same translation page, move the CTP entry to MRU. |
+| miss | hit | Update the page in CTP, set the GTD dirty bit, move to MRU. |
+| hit | miss | Update the CMT entry, set its dirty bit, move to MRU. |
+| miss | miss | `ctp_fetch_in()` the page into CTP only, then update it there. |
 
-   # Install all build dependencies automatically (Ubuntu/Debian only)
-   sudo ./pkgdep.sh
-   ```
+### Address Lookup and Update
 
-4. **Compile FEMU:**
-   ```bash
-   ./femu-compile.sh
-   ```
+- `get_maptbl_ent()` checks CMT, then CTP, and finally calls `fetch_in()` on a
+  full miss. It returns the `dppn` from whichever level answered.
+- `set_maptbl_ent()`, which originally wrote the in-DRAM mapping table in FEMU,
+  now delegates to `replace()`.
 
-   The FEMU binary will be created as: `x86_64-softmmu/qemu-system-x86_64`
+### Data GC
 
-5. **Verify installation:**
-   ```bash
-   ./qemu-system-x86_64 -device help | grep femu
-   # Should output: name "femu", bus PCI, desc "FEMU Non-Volatile Memory Express"
-   ```
+CDFTL requires that GC does **not** evict cache entries. For each valid page
+copied out of a victim block the original algorithm does:
 
-### Build Verification
+1. If the mapping is in CMT, update it there.
+2. Else if its translation page is in CTP, update it there.
+3. Otherwise read the translation page from flash, patch it, and write it back
+   immediately.
 
-To ensure your build is successful, run the basic device check:
+That linear path is kept as `set_maptbl_datagc()`. The default build uses the
+batched path described in the next section instead.
+
+### Map GC
+
+`map_garbage_collection()` is triggered whenever a translation-page write would
+run out of free translation blocks. Translation-page writes originate from:
+
+- evicting a dirty CMT entry whose page is not resident in CTP,
+- evicting a dirty CTP entry,
+- translation-page updates during data GC.
+
+Procedure:
+
+1. Select the victim with the **greedy** policy (most invalid pages).
+2. For every valid page in the victim:
+   - if the page is cached in CTP and dirty, copy the CTP version;
+   - otherwise read the page from the translation flash;
+   - merge every dirty CMT mapping that belongs to the page;
+   - clear the dirty bits and write the merged page to a fresh location.
+3. Erase the victim block and return it to the free list.
+
+## Batched Mapping Update in Data GC
+
+### Problem
+
+With the linear algorithm, every valid page whose mapping is absent from both
+caches costs one `tnand_read()` and one `tnand_write()`. When many valid pages
+in one victim block map into the **same** translation page, that page is read,
+patched and rewritten over and over. Each rewrite also invalidates the previous
+copy, which speeds up map GC.
+
+### Approach
+
+Instead of updating mappings one by one, the new mappings produced while
+cleaning a block are collected in memory, grouped by `tvpn`, and applied to each
+translation page exactly once after the whole block has been scanned.
+
+```c
+typedef struct _Bucket {
+    uint64_t dlpn;
+    uint64_t dppn;
+    struct _Bucket *next;
+} Bucket;
+
+struct _TvpnBucket {
+    Bucket   *gc_copy_list[MAX_TVPN + 1]; /* list head per tvpn              */
+    uint64_t  exist[MAX_TVPN];            /* tvpn -> index in gc_copy_list   */
+    uint64_t  bucket_size;                /* number of distinct tvpns        */
+    uint64_t  pool_idx;                   /* number of valid pages so far    */
+};
+
+Bucket bucket_pool[256];                  /* one slot per page in a block    */
+struct _TvpnBucket TvpnBucket;
+```
+
+- `bucket_pool` is a static pool with one slot per page of a block, so no
+  allocation happens during GC.
+- `exist[]` maps a `tvpn` to a 1-based slot in `gc_copy_list`, which keeps the
+  per-`tvpn` lists compact regardless of which `tvpn`s appear.
+- Each `Bucket` is 24 bytes, so the block-level pool is 6 KB.
+
+### Flow
+
+1. `clean_one_block()` resets `TvpnBucket` before scanning the victim block.
+2. `gc_write_page()` copies each valid page and appends `(dlpn, new dppn)` to the
+   list for its `tvpn` instead of touching the translation flash.
+3. After the scan, `set_maptbl_batchgc()` walks each `tvpn` list once:
+   - load the translation page (from flash, or a blank page if it never existed);
+   - for every queued mapping, update CMT if present, else CTP if present, else
+     patch the in-memory page;
+   - if anything was patched in memory, write the page **once** with
+     `tnand_write()` and update GTD and `tp2l`; otherwise leave it in cache.
+
+The same mechanism can be applied per line (superblock) instead of per block.
+That variant was measured for comparison but is not the default, because it
+needs 32x more memory.
+
+## Evaluation
+
+Workload: `fio` sequential write of 3 GB followed by 5 loops of random write of
+3 GB, unless stated otherwise. All graphs are in
+[`docs/CDFTL-report.pdf`](docs/CDFTL-report.pdf).
+
+### Translation-page writes during data GC
+
+| Scheme | Batch unit | Buffer memory | Translation writes saved vs. linear |
+|--------|-----------|---------------|-------------------------------------|
+| Linear (original CDFTL) | none | 0 | baseline |
+| **Batched (default)** | block (256 pages) | 256 x 24 B = 6 KB | about 18,000 fewer `tnand_write()` calls |
+| Batched | line (4 ch x 8 LUN x 256 pages) | 8192 x 24 B = 192 KB | about 30,000 fewer `tnand_write()` calls |
+
+Block-level batching captures most of the benefit for roughly 3% of the memory
+of the line-level variant.
+
+### Cache hit ratio vs. workload
+
+CTP caching gives spatial locality on top of CMT's temporal locality, but a
+random-write phase still lowers the combined cache hit ratio by about 30%
+compared with a sequential-write phase.
+
+### Write amplification vs. workload
+
+Only writes update the mapping, so a 50:50 read/write mix shows a lower WAF than
+a write-only workload of the same size.
+
+## Statistics
+
+The following counters are kept in `struct ssd` and printed through the FEMU
+log on demand:
+
+| Counter | Meaning |
+|---------|---------|
+| `cmt_hits`, `ctp_hits`, `cache_misses`, `total_requests` | hit/miss accounting in `get_maptbl_ent()` and `set_maptbl_ent()` |
+| `tnand_reads_cnt`, `tnand_writes_cnt` | translation-flash traffic |
+| `tnand_writes_gc` | translation-page writes caused by data GC |
+| WAF | `(host writes + GC writes + translation writes) / host writes` |
+
+They are returned by the NVMe **Get Log Page** command with log identifier
+`0x17` (`bb_get_log()` in `hw/femu/bbssd/bb.c`). Inside the guest VM:
 
 ```bash
-# Check if FEMU device is properly registered
-./qemu-system-x86_64 -device femu,help
-
-# Check version information
-./qemu-system-x86_64 --version
+sudo nvme write-amplification-log /dev/nvme0n1
 ```
 
----
+`write-amplification-log` is a small nvme-cli extension that issues that log
+page; any tool that sends Get Log Page with LID `0x17` works. The values are
+printed on the host side in the FEMU log, for example:
 
-## Quick Start
-
-### 1. VM Image Setup
-
-**Option A: Use Pre-built Image (Recommended)**
-1. Download VM image from [FEMU VM Image Portal](https://forms.gle/nEZaEe2fkj5B1bxt9)
-2. Extract to `~/images/` directory
-3. Rename to match script expectations: `u20s.qcow2`
-
-**Option B: Build Custom Image**
-```bash
-# Create image directory
-mkdir -p ~/images
-cd ~/images
-
-# Download Ubuntu Server ISO
-# If the link no longer works, visit http://releases.ubuntu.com to download the correct version of ISO image
-wget http://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso
-
-# Create VM disk image
-qemu-img create -f qcow2 femu.qcow2 80G
-
-# Install OS (requires GUI environment)
-qemu-system-x86_64 -cdrom ubuntu-24.04.3-live-server-amd64.iso \
-    -hda femu.qcow2 -boot d -net nic -net user -m 8192 -localtime -smp 8 -cpu host -enable-kvm
+```
+Cache Hit Rate Log:
+CMT Hits=..., CTP Hits=..., Cache Misses=..., Total Requests=...,
+CMT Hit Rate=..%, CTP Hit Rate=..%, Cache Miss Rate=..%
+tnand_read count : ...
+tnand_write count : ...
+tnand_write_gc count : ...
 ```
 
-### 2. Configure VM for Serial Console
+## SSD Configuration
 
-Inside the VM, edit `/etc/default/grub`:
+The FTL constants are sized for the following geometry:
 
-```bash
-sudo nano /etc/default/grub
-```
+| Parameter | Value |
+|-----------|-------|
+| Sector / page | 512 B / 4 KB (8 sectors) |
+| Pages per block | 256 |
+| Blocks per plane | 256 |
+| LUNs per channel | 8 |
+| Channels | 4 |
+| Logical capacity | 6 GB (`N_LPNS = 1,572,864`) |
+| Translation pages (`MAX_TVPN`) | 3072 |
+| Translation space | 12 MB of mappings in a 16 MB translation flash |
+| CMT / CTP | 1024 entries / 32 pages |
 
-Add these lines:
-```
-GRUB_CMDLINE_LINUX="ip=dhcp console=ttyS0,115200 console=tty console=ttyS0"
-GRUB_TERMINAL=serial
-GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1"
-```
+To reproduce this, set `nchs=4` and `ssd_size=6144` in
+`femu-scripts/run-blackbox.sh`. For a different geometry, update `MAX_TVPN`,
+`MAX_TPPN`, `MAX_CMTN` and `MAX_CTPN` in `hw/femu/bbssd/ftl.h` accordingly.
 
-Update GRUB and reboot:
-```bash
-sudo update-grub
-sudo reboot
-```
+## Build and Run
 
-### 3. Run Your First FEMU Instance
+The build follows the standard FEMU procedure.
 
 ```bash
-# From the build-femu directory
+git clone https://github.com/Jhyunil/SA-CDFTL.git
+cd SA-CDFTL
+mkdir -p build-femu && cd build-femu
+cp ../femu-scripts/femu-copy-scripts.sh .
+./femu-copy-scripts.sh .
+sudo ./pkgdep.sh      # install dependencies
+./femu-compile.sh     # configure + build qemu-system-x86_64
+```
+
+Place a guest image at `$HOME/images/u20s.qcow2` (or edit `OSIMGF` in the run
+script), then start the emulator in black-box mode:
+
+```bash
 ./run-blackbox.sh
 ```
 
-### 4. Access the VM
-
-The VM will start in text mode. You can also SSH into the VM:
-```bash
-# From host machine
-ssh -p 8080 username@localhost
-```
-
----
-
-## Usage
-
-FEMU supports multiple SSD emulation modes, each optimized for different research scenarios.
-
-### BlackBox SSD Mode (BBSSD)
-
-Emulates commercial SSDs with device-managed FTL.
-
-```bash
-./run-blackbox.sh
-```
-
-**Key Parameters:**
-```bash
-# SSD Layout Configuration
-secsz=512              # Sector size (bytes)
-secs_per_pg=8          # Sectors per page
-pgs_per_blk=256        # Pages per block
-blks_per_pl=256        # Blocks per plane
-luns_per_ch=8          # LUNs per channel
-nchs=8                 # Number of channels
-
-# Performance Configuration
-pg_rd_lat=40000        # Page read latency (ns)
-pg_wr_lat=200000       # Page write latency (ns)
-blk_er_lat=2000000     # Block erase latency (ns)
-
-# Garbage Collection
-gc_thres_pcent=75      # GC trigger threshold
-```
-
-**Use Cases:**
-- Commercial SSD simulation research
-- FTL algorithm development and testing
-- Storage system performance evaluation
-
-### WhiteBox SSD Mode (OCSSD)
-
-Emulates OpenChannel SSDs with host-managed FTL.
-
-```bash
-./run-whitebox.sh
-```
-
-**Supported Specifications:**
-- OpenChannel SSD 1.2
-- OpenChannel SSD 2.0 (default)
-
-**Configuration:**
-```bash
-# Set OCSSD version in run-whitebox.sh
-OCVER=2    # For OCSSD 2.0 (default)
-OCVER=1    # For OCSSD 1.2
-```
-
-**Use Cases:**
-- Host-side FTL research (LightNVM, SPDK)
-- Storage disaggregation studies
-- Custom wear leveling algorithms
-
-### Zoned Namespace SSD Mode (ZNSSD)
-
-Emulates NVMe ZNS SSDs with zone-based interface.
-
-```bash
-./run-zns.sh
-```
-
-**Zone Configuration:**
-- Configurable zone size and count
-- Support for zone management commands
-- Zone state tracking and validation
-
-**Use Cases:**
-- ZNS filesystem development (F2FS, Btrfs)
-- Zone-aware applications
-- Log-structured storage research
-
-### NoSSD Mode
-
-Ultra-fast NVMe emulation without storage logic.
-
-```bash
-./run-nossd.sh
-```
-
-**Characteristics:**
-- Sub-10 microsecond latency
-- No FTL or wear simulation
-- Maximum I/O performance
-
-**Use Cases:**
-- Storage-class memory (SCM) emulation
-- Performance upper-bound testing
-- Fast storage prototyping
-
----
-
-## Configuration
-
-### SSD Layout Parameters
-
-FEMU uses a hierarchical storage organization:
-
-```
-Channels → LUNs → Planes → Blocks → Pages → Sectors
-```
-
-**Key Relationships:**
-```bash
-# Total capacity calculation
-total_pages = nchs × luns_per_ch × pls_per_lun × blks_per_pl × pgs_per_blk
-total_capacity = total_pages × secs_per_pg × secsz
-
-# Example:
-# 8 × 8 × 1 × 256 × 256 × 8 × 512 = 68,719,476,736 bytes (~64GB raw)
-```
-
-### Performance Tuning
-
-**For Realistic Simulation:**
-```bash
-# Production SSD-like settings
-pg_rd_lat=40000        # 40μs read
-pg_wr_lat=200000       # 200μs write
-blk_er_lat=2000000     # 2ms erase
-```
-
-### Advanced Configuration
-
-**Memory Configuration:**
-```bash
-# In run scripts, adjust VM memory and SSD size
--m 8G                  # Guest RAM
-devsz_mb=16384         # 16GB SSD capacity
-```
-
-**Multi-Device Setup:**
-```bash
-# Add multiple FEMU devices
--device femu,devsz_mb=4096,femu_mode=1,serial=femu1 \
--device femu,devsz_mb=4096,femu_mode=1,serial=femu2
-```
-
----
-
-## Development
-
-### Building from Source
-
-For development work, use the debug build:
-
-```bash
-# Configure with debugging enabled
-../configure --enable-kvm --target-list=x86_64-softmmu \
-    --enable-debug --enable-debug-info
-
-# Compile with debug symbols
-make -j$(nproc)
-```
-
-### Code Structure
-
-```
-hw/femu/                    # Main FEMU implementation
-├── femu.c                  # NVMe controller core
-├── nvme-admin.c            # Admin command handling
-├── nvme-io.c               # I/O command handling
-├── nvme-util.c             # Utility functions
-├── bbssd/                  # BlackBox SSD implementation
-│   ├── ftl.c               # Flash Translation Layer
-│   └── bb.c                # BlackBox logic
-├── ocssd/                  # OpenChannel SSD implementation
-│   ├── oc12.c              # OCSSD 1.2 support
-│   └── oc20.c              # OCSSD 2.0 support
-├── zns/                    # ZNS implementation
-│   ├── zns.c               # ZNS logic
-│   └── zftl.c              # Zone-based FTL
-├── nossd/                  # NoSSD mode
-│   └── nop.c               # Minimal processing
-├── timing-model/           # Performance modeling
-├── backend/                # Storage backends
-└── lib/                    # Utility libraries
-```
-
-### Adding New Features
-
-1. **Create feature branch:**
-   ```bash
-   git checkout -b feature/new-ssd-mode
-   ```
-
-2. **Implement changes** following existing patterns
-
-3. **Add configuration options** in run scripts
-
-4. **Test thoroughly** across supported platforms
-
-5. **Submit pull request** with comprehensive description
-
-### Debugging
-
-**GDB Debugging:**
-```bash
-# Use provided GDB script
-./gdb-run.sh
-
-# In GDB session
-(gdb) break femu_realize
-(gdb) continue
-```
-
-**Logging:**
-```bash
-# Enable FEMU debug output
-export FEMU_DEBUG=1
-./run-blackbox.sh
-```
-
-**Trace Events:**
-```bash
-# Enable QEMU tracing
-./qemu-system-x86_64 -trace events=/path/to/trace-events
-```
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**Issue: "femu device not found"**
-```bash
-# Solution: Ensure using FEMU-compiled binary
-./qemu-system-x86_64 -device help | grep femu
-# Should show FEMU device. If not, rebuild FEMU.
-```
-
-**Issue: VM fails to boot**
-```bash
-# Check KVM support
-lsmod | grep kvm
-# Enable if needed:
-sudo modprobe kvm-intel  # Intel CPUs
-sudo modprobe kvm-amd    # AMD CPUs
-```
-
-**Issue: Poor performance**
-```bash
-# Check host CPU governor
-cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-# Set to performance:
-sudo cpupower frequency-set -g performance
-```
-
-**Issue: Build failures**
-```bash
-# Update build dependencies
-sudo apt update && sudo apt upgrade
-# Clean rebuild:
-make clean && ./femu-compile.sh
-```
-
-### Performance Optimization
-
-**Host Optimization:**
-```bash
-# Disable CPU frequency scaling
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Increase VM priority
-sudo nice -n -10 ./run-blackbox.sh
-
-# Pin QEMU threads to specific cores
-taskset -c 0-7 ./run-blackbox.sh
-```
-
-**Guest Optimization:**
-```bash
-# In VM, disable unnecessary services
-sudo systemctl disable cups bluetooth
-sudo systemctl mask sleep.target suspend.target
-
-# Use deadline scheduler for better SSD simulation
-echo deadline | sudo tee /sys/block/nvme*/queue/scheduler
-```
-
-### Logging and Monitoring
-
-**Enable detailed logging:**
-```bash
-# Set environment variables before running
-export QEMU_LOG=guest_errors,unimp
-export QEMU_LOG_FILENAME=femu-debug.log
-./run-blackbox.sh
-```
-
-**Monitor performance:**
-```bash
-# In guest VM
-sudo iostat -x 1           # I/O statistics
-sudo iotop                 # I/O by process
-sudo dstat -cdn            # System-wide stats
-```
-
-### Getting Help
-
-1. **Check [Wiki](https://github.com/MoatLab/FEMU/wiki)** for detailed documentation
-2. **Search [Issues](https://github.com/MoatLab/FEMU/issues)** for similar problems
-3. **Join discussions** in GitHub Discussions
-4. **Contact maintainers** for research collaboration
-
----
-
-## Research & Citation
-
-FEMU has been used in numerous systems research projects across top-tier venues including ASPLOS, OSDI, SOSP, FAST, SIGCOMM, HPCA, DAC, DATE, etc.
-
-**Please check the growing list of research papers using FEMU [here](https://github.com/MoatLab/FEMU/wiki/Research-Papers-using-FEMU), including papers at ASPLOS, OSDI, SOSP and FAST, etc.**
-
-### Primary Citation
-
-If you use FEMU in your research, please cite our FAST 2018 paper:
-
-```bibtex
-@inproceedings{Li+18-FEMU,
-  author    = {Huaicheng Li and Mingzhe Hao and Michael Hao Tong and
-               Swaminathan Sundararaman and Matias Bj{\o}rling and Haryadi S. Gunawi},
-  title     = {{The CASE of FEMU: Cheap, Accurate, Scalable and Extensible Flash Emulator}},
-  booktitle = {16th USENIX Conference on File and Storage Technologies (FAST 18)},
-  year      = {2018},
-}
-```
-
-### Related Publications
-
-**FEMU-based Research:**
-- See our growing list of [research papers using FEMU](https://github.com/MoatLab/FEMU/wiki/Research-Papers-using-FEMU)
-- Papers span storage systems, operating systems, and computer architecture
-
-**Technical Reports:**
-- FEMU technical details and validation studies
-- Performance characterization and accuracy analysis
-
----
-
-## Contributing
-
-We welcome contributions from the community! FEMU is actively used in systems research worldwide.
-
-### How to Contribute
-
-1. **Fork** the repository
-2. **Create** a feature branch (`git checkout -b feature/amazing-feature`)
-3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
-4. **Push** to the branch (`git push origin feature/amazing-feature`)
-5. **Open** a Pull Request
-
-### Contribution Guidelines
-
-**Code Style:**
-- Follow existing QEMU coding standards
-- Use consistent indentation (4 spaces)
-- Add comprehensive comments for new features
-- Include error handling and validation
-
-**Testing:**
-- Test on multiple host distributions
-- Validate all SSD modes still function
-- Include performance regression tests
-- Document any new configuration options
-
-**Documentation:**
-- Update relevant README sections
-- Add inline code documentation
-- Create wiki pages for major features
-- Include usage examples
-
-### Research Collaborations
-
-**Academic Partnerships:**
-- We welcome research collaborations
-- Joint paper development opportunities
-- Access to advanced FEMU features
-- Performance optimization consulting
-
-**Contact for Research:**
-- Email: [huaicheng@cs.vt.edu](mailto:huaicheng@cs.vt.edu)
-- Include: research area, institution, timeline
-
----
-
-## Support
-
-### Community Support
-
-- **GitHub Issues**: [Report bugs and request features](https://github.com/MoatLab/FEMU/issues)
-- **GitHub Discussions**: [Community Q&A and discussions](https://github.com/MoatLab/FEMU/discussions)
-- **Wiki**: [Comprehensive documentation](https://github.com/MoatLab/FEMU/wiki)
-
-### Professional Support
-
-For research institutions and industry partners:
-- Custom FEMU development and consulting
-- Performance optimization services
-- Training workshops and tutorials
-- Priority technical support
-
-**Contact**: [Huaicheng Li](mailto:huaicheng@cs.vt.edu), Virginia Tech
-
-### Reporting Issues
-
-**Bug Reports:**
-Include the following information:
-- Host OS and kernel version
-- FEMU version and commit hash
-- Complete error messages or logs
-- Steps to reproduce the issue
-- Expected vs actual behavior
-
-**Feature Requests:**
-- Describe the use case and motivation
-- Provide technical requirements
-- Suggest implementation approach if available
-- Consider contributing implementation
-
----
+The emulated NVMe device shows up inside the guest as `/dev/nvme0n1`. Run your
+workload (for example with `fio`) and query the statistics as shown above. See
+the [FEMU wiki](https://github.com/MoatLab/FEMU/wiki) for guest image
+preparation and general usage.
+
+## Repository Layout
+
+| Path | Contents |
+|------|----------|
+| `hw/femu/bbssd/ftl.c` | translation flash, GTD/CMT/CTP, fetch-in, replace, data GC, map GC, batched GC update |
+| `hw/femu/bbssd/ftl.h` | data structures, constants, prototypes |
+| `hw/femu/bbssd/bb.c` | NVMe command hooks, statistics log page |
+| `femu-scripts/` | build and run scripts |
+| `docs/CDFTL-report.pdf` | design report with graphs and raw numbers |
+
+Everything outside `hw/femu` is unmodified FEMU / QEMU.
+
+## References
+
+- Z. Qin, Y. Wang, D. Liu, and Z. Shao, *An Adaptive Demand-Based Caching
+  Mechanism for NAND Flash Memory Storage Systems*, ACM Transactions on Design
+  Automation of Electronic Systems, 2012.
+- A. Gupta, Y. Kim, and B. Urgaonkar, *DFTL: A Flash Translation Layer Employing
+  Demand-based Selective Caching of Page-level Address Mappings*, ASPLOS 2009.
+- H. Li et al., *The CASE of FEMU: Cheap, Accurate, Scalable and Extensible Flash
+  Emulator*, FAST 2018. https://github.com/MoatLab/FEMU
 
 ## License
 
-FEMU is released under the **GNU General Public License v2.0**.
-
-```
-Copyright (C) 2018-2024 Virginia Tech and Contributors
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-```
-
-Full license text: [GPL-2.0](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
-
-### Third-Party Components
-
-FEMU incorporates code from several projects:
-
-- **QEMU**: Machine emulator and virtualizer (GPL v2.0)
-- **NVMe QEMU**: NVMe controller implementation
-- **LightNVM**: OpenChannel SSD support
-- **Linux Kernel**: Headers and interface definitions (GPL v2.0)
-
-See individual file headers for specific attribution details.
-
----
-
-## Acknowledgments
-
-### Research Community
-
-FEMU development is supported by:
-- **Virginia Tech** - Primary development and maintenance
-- **Research collaborators** - Algorithm contributions and validation
-- **Systems community** - Feedback, bug reports, and improvements
-
-### Technical Foundation
-
-FEMU builds upon several pioneering projects:
-- **QEMU/KVM** - Virtualization infrastructure
-- **SSD Simulators** - SSDSim, FlashSim, VSSIM concepts
-- **Hardware Platforms** - OpenSSD, DFC design insights
-- **Standards Bodies** - NVMe, OpenChannel, ZNS specifications
-
-### Contributors
-
-We thank all contributors who have helped improve FEMU:
-- Algorithm developers and performance optimizers
-- Platform porting and compatibility testing
-- Documentation improvements and examples
-- Bug reports and feature suggestions
-
-
----
-
-**For more detailed information, visit the [FEMU Wiki](https://github.com/MoatLab/FEMU/wiki).**
-
----
-
-<p align="center">
-  <strong>FEMU</strong> - Advancing Next-Generation Storage Systems Research<br>
-  <em>Fast • Accurate • Scalable • Extensible</em>
-</p>
+This project inherits the license of FEMU and QEMU, GPL-2.0. See
+[`LICENSE`](LICENSE) and [`COPYING`](COPYING).
